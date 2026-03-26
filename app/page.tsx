@@ -1,247 +1,260 @@
 "use client";
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Paperclip, Smile, Image as ImageIcon, Send, Mic, ChevronLeft, Search, MoreVertical, X, LogOut, User } from 'lucide-react';
+import { Paperclip, Smile, Image as ImageIcon, Send, Mic, ChevronLeft, Search, MoreVertical, X, LogOut, UserPlus } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 
 type Message = {
   id: string;
   text: string | null;
-  sender: string;
+  from_id: string;
+  to_id: string;
   type: 'text' | 'image';
   image_url: string | null;
   created_at: string;
 };
 
+type Profile = {
+  id: string;
+  username: string;
+};
+
 export default function ChatPage() {
-  // --- СОСТОЯНИЯ АВТОРИЗАЦИИ ---
   const [user, setUser] = useState<any>(null);
+  const [myProfile, setMyProfile] = useState<Profile | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [usernameInput, setUsernameInput] = useState(""); // Для регистрации никнейма
   const [isRegistering, setIsRegistering] = useState(false);
 
-  // --- СОСТОЯНИЯ ЧАТА ---
-  const [selectedChat, setSelectedChat] = useState<number | null>(null);
+  // Состояния чата
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedUser, setSelectedUser] = useState<Profile | null>(null);
   const [message, setMessage] = useState("");
-  const [showAttachments, setShowAttachments] = useState(false);
   const [chatHistory, setChatHistory] = useState<Message[]>([]);
   const [fullScreenImage, setFullScreenImage] = useState<string | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // 1. ПРОВЕРКА СЕССИИ ПРИ ЗАГРУЗКЕ
+  // 1. ПРОВЕРКА СЕССИИ И ПРОФИЛЯ
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user ?? null);
+      if (session?.user) fetchMyProfile(session.user.id);
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
+      if (session?.user) fetchMyProfile(session.user.id);
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  // 2. ЗАГРУЗКА СООБЩЕНИЙ И REALTIME
+  const fetchMyProfile = async (userId: string) => {
+    const { data } = await supabase.from('profiles').select('*').eq('id', userId).single();
+    if (data) setMyProfile(data);
+  };
+
+  // 2. ЗАГРУЗКА ЛИЧНЫХ СООБЩЕНИЙ
   useEffect(() => {
-    if (!user) return;
+    if (!user || !selectedUser) return;
 
     const fetchMessages = async () => {
-      const { data } = await supabase.from('messages').select('*').order('created_at', { ascending: true });
+      const { data } = await supabase
+        .from('messages')
+        .select('*')
+        .or(`and(from_id.eq.${user.id},to_id.eq.${selectedUser.id}),and(from_id.eq.${selectedUser.id},to_id.eq.${user.id})`)
+        .order('created_at', { ascending: true });
       if (data) setChatHistory(data as Message[]);
     };
 
     fetchMessages();
 
-    const channel = supabase.channel('schema-db-changes')
+    const channel = supabase.channel(`chat-${selectedUser.id}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
         const newMessage = payload.new as Message;
-        setChatHistory(prev => {
-          const exists = prev.some(m => m.id === newMessage.id);
-          if (exists) return prev;
-          return [...prev, newMessage];
-        });
+        // Показываем только если сообщение относится к текущему чату
+        if ((newMessage.from_id === user.id && newMessage.to_id === selectedUser.id) || 
+            (newMessage.from_id === selectedUser.id && newMessage.to_id === user.id)) {
+          setChatHistory(prev => [...prev, newMessage]);
+        }
       }).subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, [user]);
+  }, [user, selectedUser]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory]);
 
-  // 3. ФУНКЦИИ AUTH
+  // 3. ФУНКЦИИ АВТОРИЗАЦИИ И ПОИСКА
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isRegistering) {
-      const { error } = await supabase.auth.signUp({ email, password });
-      if (error) alert(error.message);
-      else alert("Проверьте почту для подтверждения (если включено) или попробуйте войти");
+      const { data, error } = await supabase.auth.signUp({ email, password });
+      if (error) return alert(error.message);
+      // После регистрации создаем профиль
+      if (data.user) {
+        await supabase.from('profiles').insert([{ id: data.user.id, username: usernameInput }]);
+      }
+      alert("Аккаунт создан!");
     } else {
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) alert(error.message);
     }
   };
 
-  const handleLogout = () => supabase.auth.signOut();
+  const handleSearchUser = async () => {
+    if (!searchQuery) return;
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('username', searchQuery.trim())
+      .single();
+    
+    if (data) {
+      setSelectedUser(data);
+      setSearchQuery("");
+    } else {
+      alert("Пользователь не найден");
+    }
+  };
 
-  // 4. ОТПРАВКА
   const handleSend = async (content: string, type: 'text' | 'image' = 'text') => {
     if (!content.trim() && type === 'text') return;
+    if (!selectedUser || !user) return;
 
-    const { error } = await supabase.from('messages').insert([
-      { text: type === 'text' ? content : null, image_url: type === 'image' ? content : null, type, sender: user?.email }
+    await supabase.from('messages').insert([
+      { text: type === 'text' ? content : null, image_url: type === 'image' ? content : null, type, from_id: user.id, to_id: selectedUser.id }
     ]);
-
-    if (error) console.error(error.message);
     setMessage("");
-    setShowAttachments(false);
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const localUrl = URL.createObjectURL(file); // Временное превью
-    handleSend(localUrl, 'image');
-  };
-
-  // --- ЕСЛИ ПОЛЬЗОВАТЕЛЬ НЕ ВОЙДЕЛ ---
-  if (!user) {
+  // --- ЭКРАН ВХОДА ---
+ if (!user) {
     return (
-      <div className="h-[100dvh] bg-[#0e1621] flex items-center justify-center p-6 text-white">
-        <div className="w-full max-w-sm space-y-8">
-          <div className="text-center">
-            <div className="w-20 h-20 bg-blue-500 rounded-3xl mx-auto flex items-center justify-center shadow-2xl mb-6">
-              <Send size={40} className="text-white ml-[-4px]" />
-            </div>
-            <h2 className="text-2xl font-bold italic tracking-tight">Telegram Clone</h2>
-            <p className="text-gray-400 mt-2 text-sm">{isRegistering ? 'Создать новый аккаунт' : 'Войти в мессенджер'}</p>
-          </div>
-          <form className="mt-8 space-y-4" onSubmit={handleAuth}>
-            <input 
-              type="email" placeholder="Email" required 
-              className="w-full bg-[#17212b] border border-gray-800 p-3 rounded-xl outline-none focus:border-blue-500 transition-all"
-              value={email} onChange={(e) => setEmail(e.target.value)}
-            />
-            <input 
-              type="password" placeholder="Пароль" required 
-              className="w-full bg-[#17212b] border border-gray-800 p-3 rounded-xl outline-none focus:border-blue-500 transition-all"
-              value={password} onChange={(e) => setPassword(e.target.value)}
-            />
-            <button type="submit" className="w-full bg-blue-500 hover:bg-blue-600 p-3 rounded-xl font-bold transition-all shadow-lg active:scale-95">
-              {isRegistering ? 'Зарегистрироваться' : 'Далее'}
-            </button>
-          </form>
+      <div className="h-[100dvh] bg-[#0e1621] flex items-center justify-center p-6 text-white text-center">
+        <form className="w-full max-w-sm space-y-4" onSubmit={handleAuth}>
+          <div className="w-20 h-20 bg-blue-500 rounded-3xl mx-auto flex items-center justify-center mb-4"><Send size={40} /></div>
+          <h2 className="text-2xl font-bold italic">Telegram Private</h2>
+          {isRegistering && (
+            <input type="text" placeholder="Придумайте никнейм" required className="w-full bg-[#17212b] border border-gray-800 p-3 rounded-xl outline-none focus:border-blue-500" value={usernameInput} onChange={(e) => setUsernameInput(e.target.value)} />
+          )}
+          <input type="email" placeholder="Email" required className="w-full bg-[#17212b] border border-gray-800 p-3 rounded-xl outline-none focus:border-blue-500" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input type="password" placeholder="Пароль" required className="w-full bg-[#17212b] border border-gray-800 p-3 rounded-xl outline-none focus:border-blue-500" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <button type="submit" className="w-full bg-blue-500 p-3 rounded-xl font-bold">{isRegistering ? 'Создать аккаунт' : 'Войти'}</button>
+          <button type="button" onClick={() => setIsRegistering(!isRegistering)} className="w-full text-blue-400 text-sm">{isRegistering ? 'Уже есть аккаунт?' : 'Создать аккаунт'}</button>
+        </form>
+      </div>
+    );
+  }
+
+  // НОВОЕ: Если юзер вошел, но профиля с ником нет (для старых аккаунтов)
+  if (user && !myProfile) {
+    return (
+      <div className="h-[100dvh] bg-[#0e1621] flex items-center justify-center p-6 text-white text-center">
+        <div className="w-full max-w-sm space-y-4">
+          <h2 className="text-xl font-bold">Завершите регистрацию</h2>
+          <p className="text-sm text-gray-400">Пожалуйста, придумайте никнейм, чтобы другие могли вас найти.</p>
+          <input 
+            type="text" placeholder="Ваш никнейм" 
+            className="w-full bg-[#17212b] border border-gray-800 p-3 rounded-xl outline-none focus:border-blue-500" 
+            value={usernameInput} onChange={(e) => setUsernameInput(e.target.value)} 
+          />
           <button 
-            onClick={() => setIsRegistering(!isRegistering)}
-            className="w-full text-blue-400 text-sm hover:underline"
+            onClick={async () => {
+               if (usernameInput.length < 3) return alert("Минимум 3 символа");
+               const { error } = await supabase.from('profiles').insert([{ id: user.id, username: usernameInput }]);
+               if (error) alert("Ник уже занят или ошибка: " + error.message);
+               else fetchMyProfile(user.id);
+            }}
+            className="w-full bg-blue-500 p-3 rounded-xl font-bold"
           >
-            {isRegistering ? 'Уже есть аккаунт? Войти' : 'Нет аккаунта? Создать'}
+            Сохранить никнейм
           </button>
         </div>
       </div>
     );
   }
 
-  // --- ОСНОВНОЙ ИНТЕРФЕЙС ЧАТА ---
+  // --- ОСНОВНОЙ ЧАТ ---
   return (
-    <div className="flex h-[100dvh] bg-[#0e1621] text-white overflow-hidden font-sans select-none">
-      <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
-
-      {/* ПРОСМОТР ФОТО НА ВЕСЬ ЭКРАН */}
+    <div className="flex h-[100dvh] bg-[#0e1621] text-white overflow-hidden">
       {fullScreenImage && (
-        <div className="fixed inset-0 bg-black/95 z-[100] flex items-center justify-center p-4 animate-in fade-in duration-200" onClick={() => setFullScreenImage(null)}>
+        <div className="fixed inset-0 bg-black z-[100] flex items-center justify-center" onClick={() => setFullScreenImage(null)}>
           <img src={fullScreenImage} className="max-w-full max-h-full object-contain" />
-          <button className="absolute top-6 right-6 text-white bg-white/10 p-2 rounded-full hover:bg-white/20"><X size={24}/></button>
         </div>
       )}
 
-      {/* ЛЕВАЯ ПАНЕЛЬ */}
-      <aside className={`${selectedChat !== null ? 'hidden' : 'flex'} md:flex w-full md:w-[350px] border-r border-gray-900 flex-col bg-[#17212b]`}>
-        <div className="p-4 flex items-center gap-3">
-          <button onClick={handleLogout} className="p-2 hover:bg-red-500/20 rounded-full text-red-400 transition-colors"><LogOut size={20}/></button>
-          <div className="flex-1 bg-[#0e1621] rounded-full flex items-center px-3 py-1.5 border border-transparent focus-within:border-blue-500">
+      {/* ЛЕВАЯ ПАНЕЛЬ С ПОИСКОМ */}
+      <aside className={`${selectedUser ? 'hidden' : 'flex'} md:flex w-full md:w-[350px] border-r border-gray-900 flex-col bg-[#17212b]`}>
+        <div className="p-4 flex items-center gap-2">
+          <div className="flex-1 bg-[#0e1621] rounded-full flex items-center px-3 py-1.5">
             <Search size={16} className="text-gray-500" />
-            <input placeholder="Поиск" className="bg-transparent border-none focus:ring-0 ml-2 w-full text-sm outline-none" />
+            <input 
+              placeholder="Поиск по никнейму..." 
+              className="bg-transparent border-none focus:ring-0 ml-2 w-full text-sm outline-none"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && handleSearchUser()}
+            />
           </div>
+          <button onClick={handleSearchUser} className="text-blue-400"><UserPlus size={24} /></button>
         </div>
+        
         <div className="flex-1 overflow-y-auto">
-           <div onClick={() => setSelectedChat(1)} className={`flex items-center p-3 cursor-pointer ${selectedChat === 1 ? 'bg-[#2b5278]' : 'hover:bg-[#202b36]'}`}>
-              <div className="w-12 h-12 rounded-full bg-blue-500 mr-3 flex items-center justify-center font-bold">U</div>
-              <div className="flex-1 min-w-0">
-                <div className="flex justify-between items-center"><span className="font-bold text-sm">Общий чат</span></div>
-                <p className="text-xs text-blue-300 truncate font-medium italic">Вы вошли как {user.email}</p>
-              </div>
-           </div>
+          {selectedUser && (
+            <div className="bg-[#2b5278] p-4 flex items-center gap-3">
+              <div className="w-12 h-12 bg-blue-400 rounded-full flex items-center justify-center font-bold">{selectedUser.username[0].toUpperCase()}</div>
+              <div><div className="font-bold">{selectedUser.username}</div><div className="text-xs text-blue-200">Переписка начата</div></div>
+            </div>
+          )}
+          <div className="p-4 text-center text-xs text-gray-500 italic mt-10">
+            {myProfile ? `Ваш ник: @${myProfile.username}` : "Загрузка профиля..."}
+          </div>
+          <button onClick={() => supabase.auth.signOut()} className="m-4 text-red-400 flex items-center gap-2 text-sm italic opacity-50"><LogOut size={16}/> Выйти</button>
         </div>
       </aside>
 
-      {/* ПРАВАЯ ПАНЕЛЬ */}
-      <main className={`${selectedChat === null ? 'hidden' : 'flex'} md:flex flex-1 flex-col relative`}>
-        {selectedChat ? (
+      {/* ОКНО ЧАТА */}
+      <main className={`${!selectedUser ? 'hidden' : 'flex'} md:flex flex-1 flex-col relative`}>
+        {selectedUser ? (
           <>
-            <header className="h-14 px-4 bg-[#17212b]/95 backdrop-blur-md flex items-center justify-between border-b border-gray-900 z-20">
-              <div className="flex items-center">
-                <button onClick={() => setSelectedChat(null)} className="md:hidden mr-2 text-blue-400"><ChevronLeft size={28} /></button>
-                <div className="w-9 h-9 bg-blue-500 rounded-full mr-3 flex items-center justify-center font-bold text-xs italic">OC</div>
-                <div><div className="font-bold text-[14px]">Общий чат</div><div className="text-[10px] text-blue-400">в сети</div></div>
-              </div>
-              <MoreVertical size={20} className="text-gray-400 cursor-pointer" />
+            <header className="h-14 px-4 bg-[#17212b] flex items-center gap-3 border-b border-gray-900">
+              <button onClick={() => setSelectedUser(null)} className="md:hidden text-blue-400"><ChevronLeft size={28} /></button>
+              <div className="w-9 h-9 bg-blue-500 rounded-full flex items-center justify-center font-bold text-xs">{selectedUser.username[0].toUpperCase()}</div>
+              <div className="font-bold">{selectedUser.username}</div>
             </header>
 
             <div className="flex-1 p-4 overflow-y-auto space-y-3 bg-[url('https://user-images.githubusercontent.com/15075759/28719144-86dc0f70-73b1-11e7-911d-60d70fcded21.png')] bg-fixed opacity-95">
-              {chatHistory.map((msg) => {
-                const isMe = msg.sender === user?.email;
-                const isImg = msg.type === 'image' || (msg.image_url && msg.image_url.length > 5);
-                return (
-                  <div key={msg.id} className={`flex ${isMe ? 'justify-end' : 'justify-start'}`}>
-                    <div 
-                      onClick={() => isImg && setFullScreenImage(msg.image_url)}
-                      className={`relative max-w-[85%] sm:max-w-[70%] shadow-xl cursor-pointer ${isImg ? 'p-1 rounded-xl' : 'px-3 py-1.5 rounded-2xl'} ${isMe ? 'bg-[#2b5278] rounded-tr-none' : 'bg-[#182533] rounded-tl-none'}`}
-                    >
-                      {isImg ? (
-                        <img src={msg.image_url || ''} alt="img" className="rounded-lg max-h-80 object-cover min-w-[100px]" />
-                      ) : (
-                        <p className="text-[15px] pr-10 break-words leading-relaxed">{msg.text}</p>
-                      )}
-                      <div className="absolute bottom-1 right-2 flex items-center gap-1 bg-black/20 px-1 rounded">
-                        <span className="text-[9px] text-gray-300 opacity-80">{new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                        {isMe && <span className="text-blue-300 text-[10px]">✓✓</span>}
-                      </div>
-                    </div>
+              {chatHistory.map((msg) => (
+                <div key={msg.id} className={`flex ${msg.from_id === user.id ? 'justify-end' : 'justify-start'}`}>
+                  <div 
+                    onClick={() => msg.type === 'image' && setFullScreenImage(msg.image_url)}
+                    className={`relative max-w-[80%] p-2 rounded-2xl ${msg.from_id === user.id ? 'bg-[#2b5278] rounded-tr-none' : 'bg-[#182533] rounded-tl-none'}`}
+                  >
+                    {msg.type === 'image' ? (
+                      <img src={msg.image_url!} className="rounded-lg max-h-60 object-cover cursor-pointer" />
+                    ) : (
+                      <p className="text-sm pr-10">{msg.text}</p>
+                    )}
+                    <span className="text-[9px] text-gray-400 absolute bottom-1 right-2">{new Date(msg.created_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                   </div>
-                );
-              })}
+                </div>
+              ))}
               <div ref={messagesEndRef} />
             </div>
 
-            {showAttachments && (
-              <div className="absolute bottom-20 left-4 bg-[#1c242f] border border-gray-800 rounded-2xl p-4 shadow-2xl flex gap-6 z-30 animate-in zoom-in-95">
-                <button onClick={() => fileInputRef.current?.click()} className="flex flex-col items-center gap-1 hover:scale-110 transition-transform">
-                  <div className="w-12 h-12 bg-blue-600 rounded-full flex items-center justify-center"><ImageIcon size={22}/></div>
-                  <span className="text-[11px] font-medium text-gray-300">Галерея</span>
-                </button>
-              </div>
-            )}
-
-            <footer className="p-3 bg-[#17212b] border-t border-gray-900">
-              <form onSubmit={(e) => { e.preventDefault(); handleSend(message); }} className="max-w-5xl mx-auto flex items-end gap-2">
-                <button type="button" onClick={() => setShowAttachments(!showAttachments)} className={`p-2 transition-all ${showAttachments ? 'text-blue-400 rotate-45' : 'text-gray-400 hover:text-blue-400'}`}>
-                  <Paperclip size={24} />
-                </button>
-                <div className="flex-1 bg-[#0e1621] rounded-2xl flex items-center px-4 min-h-[44px] border border-gray-800 focus-within:border-gray-700">
-                  <input value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Сообщение" className="flex-1 bg-transparent border-none focus:ring-0 py-2 text-[16px] outline-none" />
-                  <Smile size={22} className="text-gray-400 cursor-pointer hover:text-white" />
-                </div>
-                <button type="submit" className="w-11 h-11 bg-blue-500 rounded-full flex items-center justify-center hover:bg-blue-600 active:scale-90 transition-all flex-shrink-0">
-                  {message.trim() ? <Send size={20} /> : <Mic size={22} />}
-                </button>
+            <footer className="p-3 bg-[#17212b]">
+              <form onSubmit={(e) => {e.preventDefault(); handleSend(message)}} className="flex items-center gap-2">
+                <input value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Написать..." className="flex-1 bg-[#0e1621] p-3 rounded-2xl outline-none" />
+                <button type="submit" className="bg-blue-500 w-11 h-11 rounded-full flex items-center justify-center"><Send size={20}/></button>
               </form>
             </footer>
           </>
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center text-gray-600 italic">💬 Выберите чат</div>
+          <div className="flex-1 flex items-center justify-center text-gray-500 italic">Напишите никнейм друга в поиске слева</div>
         )}
       </main>
     </div>
