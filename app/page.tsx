@@ -93,33 +93,56 @@ export default function ChatPage() {
   };
 
   // 2. ЗАГРУЗКА И REALTIME СООБЩЕНИЙ
-  useEffect(() => {
-    if (!user || !selectedUser) return;
+useEffect(() => {
+  if (!user || !selectedUser) return;
 
-    const fetchMessages = async () => {
-      const { data } = await supabase
-        .from('messages')
-        .select('*')
-        .or(`and(from_id.eq.${user.id},to_id.eq.${selectedUser.id}),and(from_id.eq.${selectedUser.id},to_id.eq.${user.id})`)
-        .order('created_at', { ascending: true });
-      if (data) setChatHistory(data as Message[]);
-    };
+  // 1. Загрузка истории (уже работает)
+  const fetchMessages = async () => {
+    const { data } = await supabase
+      .from('messages')
+      .select('*')
+      .or(`and(from_id.eq.${user.id},to_id.eq.${selectedUser.id}),and(from_id.eq.${selectedUser.id},to_id.eq.${user.id})`)
+      .order('created_at', { ascending: true });
+    if (data) setChatHistory(data as Message[]);
+  };
 
-    fetchMessages();
+  fetchMessages();
 
-    const channel = supabase.channel(`chat-${selectedUser.id}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
+  // 2. Слушаем новые сообщения В РЕАЛЬНОМ ВРЕМЕНИ
+  const channel = supabase
+    .channel('messages-realtime') // Даем уникальное имя каналу
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages',
+      },
+      (payload) => {
         const newMessage = payload.new as Message;
-        if ((newMessage.from_id === user.id && newMessage.to_id === selectedUser.id) || 
-            (newMessage.from_id === selectedUser.id && newMessage.to_id === user.id)) {
-          setChatHistory(prev => [...prev, newMessage]);
-          // Если это новый человек, обновляем список чатов
+        
+        // Проверяем: относится ли это сообщение к нашему текущему открытому чату?
+        const isRelevant = 
+          (newMessage.from_id === user.id && newMessage.to_id === selectedUser.id) || 
+          (newMessage.from_id === selectedUser.id && newMessage.to_id === user.id);
+
+        if (isRelevant) {
+          setChatHistory((prev) => {
+            // Проверка на дубликаты (на всякий случай)
+            if (prev.find(m => m.id === newMessage.id)) return prev;
+            return [...prev, newMessage];
+          });
+          // Обновляем список чатов слева, чтобы поднять этот чат выше
           fetchRecentChats(user.id);
         }
-      }).subscribe();
+      }
+    )
+    .subscribe();
 
-    return () => { supabase.removeChannel(channel); };
-  }, [user, selectedUser]);
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}, [user, selectedUser]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
